@@ -125,8 +125,32 @@ class MainWindow(QMainWindow):
         self.fcm.push_received.connect(self._on_push)
         self.fcm.start()
 
+        # Keep saved Riot sessions alive: minting rotates the SSO cookies (sliding
+        # expiry), so refreshing every few hours while the app sits in the tray
+        # stops QR sign-in / push from expiring after a couple idle days.
+        self._session_timer = QTimer(self)
+        self._session_timer.timeout.connect(self._refresh_sessions)
+        self._session_timer.start(6 * 60 * 60 * 1000)  # every 6 hours
+        QTimer.singleShot(20_000, self._refresh_sessions)  # once shortly after start
+
         self._update_found.connect(self._on_update_found)
         threading.Thread(target=self._check_update, daemon=True).start()
+
+    def _refresh_sessions(self):
+        """Refresh every account's stored RSO session off the GUI thread so the
+        rotated SSO cookies get persisted before the old ones expire."""
+        accounts = [a for a in self.accounts if a.get("sso")]
+        if not accounts:
+            return
+
+        def work():
+            for acct in accounts:
+                try:
+                    self._valid_access_token(acct)
+                except Exception:
+                    pass
+
+        threading.Thread(target=work, name="session-refresh", daemon=True).start()
 
     def _check_update(self):
         info = updater.check_for_update()
@@ -370,12 +394,19 @@ class MainWindow(QMainWindow):
         sso = account.get("sso")
         if sso:
             try:
-                token = mint_access_token(sso)
+                token, refreshed = mint_access_token(sso)
             except Exception:
-                token = None
+                token, refreshed = None, sso
+            dirty = False
+            if refreshed and refreshed != sso:
+                account["sso"] = refreshed  # persist Riot's rotated session cookies
+                dirty = True
             if token:
                 account["access_token"] = token
+                dirty = True
+            if dirty:
                 save_accounts(self.accounts)
+            if token:
                 return token
         token = account.get("access_token")
         if token and is_valid_jwt(token):

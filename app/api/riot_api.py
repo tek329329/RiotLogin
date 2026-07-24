@@ -199,13 +199,30 @@ _REAUTH_BODY = {
     "riot://riot.authenticator/session.auth",
 }
 
+def _merge_sso_cookies(existing, jar):
+    """Overlay the SSO cookies Riot just rotated (from `jar`) onto `existing`.
+
+    Riot refreshes the SSO cookies on every authorize call, so only the values it
+    actually sent back are updated; anything it left untouched is preserved.
+    """
+    merged = dict(existing)
+    for cookie in jar:
+        if cookie.name in SSO_COOKIE_NAMES and cookie.value:
+            merged[cookie.name] = cookie.value
+    return merged
+
+
 def mint_access_token(sso_cookies):
     """Mint a fresh RSO access token from stored SSO cookies (needs `ssid`).
 
-    Returns the access token, or None if the session has expired (re-login needed).
+    Returns (access_token, refreshed_sso_cookies). The token is None if the session
+    has expired (re-login needed). Riot rotates the SSO cookies (a sliding expiry)
+    on every authorize call, so the refreshed jar MUST be persisted — otherwise the
+    saved session decays to the original cookies' fixed expiry (a few days) and dies
+    even though the session is still alive on Riot's side.
     """
     if not sso_cookies or not sso_cookies.get("ssid"):
-        return None
+        return None, sso_cookies
     session = requests.Session()
     for name, value in sso_cookies.items():
         if value:
@@ -218,12 +235,13 @@ def mint_access_token(sso_cookies):
         allow_redirects=False,
     )
     resp.raise_for_status()
+    refreshed = _merge_sso_cookies(sso_cookies, session.cookies)
     data = resp.json()
     if data.get("type") != "response":
-        return None
+        return None, refreshed
     uri = (((data.get("response") or {}).get("parameters") or {}).get("uri")) or ""
     match = re.search(r"access_token=([^&]+)", uri)
-    return match.group(1) if match else None
+    return (match.group(1) if match else None), refreshed
 
 RSO_AUTH_HOST = "https://authenticate.riotgames.com"
 QR_SESSION_INFO_PATH = "/api/v1/session/info"
