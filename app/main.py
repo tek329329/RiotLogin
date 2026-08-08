@@ -31,5 +31,8 @@ def main():
     app.setWindowIcon(QIcon(ICON_PATH))
     app.setQuitOnLastWindowClosed(False)
     win = MainWindow()
-    win.show()
+    if "--startup" in sys.argv:
+        win.start_in_tray()  # launched at login: stay hidden in the tray
+    else:
+        win.show()
     sys.exit(app.exec())

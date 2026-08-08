@@ -199,6 +199,14 @@ _REAUTH_BODY = {
     "riot://riot.authenticator/session.auth",
 }
 
+class SessionExpired(Exception):
+    """Riot rejected the stored SSO session — only a real re-login can fix it.
+
+    Distinct from network/HTTP errors, which are transient and must NOT be
+    treated as "re-add this account".
+    """
+
+
 def _merge_sso_cookies(existing, jar):
     """Overlay the SSO cookies Riot just rotated (from `jar`) onto `existing`.
 
@@ -215,14 +223,18 @@ def _merge_sso_cookies(existing, jar):
 def mint_access_token(sso_cookies):
     """Mint a fresh RSO access token from stored SSO cookies (needs `ssid`).
 
-    Returns (access_token, refreshed_sso_cookies). The token is None if the session
-    has expired (re-login needed). Riot rotates the SSO cookies (a sliding expiry)
-    on every authorize call, so the refreshed jar MUST be persisted — otherwise the
-    saved session decays to the original cookies' fixed expiry (a few days) and dies
-    even though the session is still alive on Riot's side.
+    Returns (access_token, refreshed_sso_cookies, ssid_expires_at). Riot rotates the
+    SSO cookies on every successful authorize call and pushes the expiry ~30 days
+    out, so the refreshed jar MUST be persisted — otherwise the saved session decays
+    to the original cookies' expiry and dies while still alive on Riot's side.
+
+    Raises SessionExpired when Riot rejects the session (it answers HTTP 200 with
+    `type != "response"` and omits ssid/csid, so this is NOT an HTTP error).
+    Network/HTTP failures propagate as their own exceptions — they are transient and
+    the caller must leave the stored cookies untouched.
     """
     if not sso_cookies or not sso_cookies.get("ssid"):
-        return None, sso_cookies
+        raise SessionExpired("no stored ssid")
     session = requests.Session()
     for name, value in sso_cookies.items():
         if value:
@@ -235,13 +247,18 @@ def mint_access_token(sso_cookies):
         allow_redirects=False,
     )
     resp.raise_for_status()
-    refreshed = _merge_sso_cookies(sso_cookies, session.cookies)
     data = resp.json()
     if data.get("type") != "response":
-        return None, refreshed
+        # Session rejected. Riot's cookies here are a signed-out set (no ssid/csid) —
+        # persisting them would corrupt a jar that may still be good, so send nothing back.
+        raise SessionExpired(f"authorize returned type={data.get('type')!r}")
+    refreshed = _merge_sso_cookies(sso_cookies, session.cookies)
+    expires_at = next(
+        (c.expires for c in session.cookies if c.name == "ssid" and c.expires), None
+    )
     uri = (((data.get("response") or {}).get("parameters") or {}).get("uri")) or ""
     match = re.search(r"access_token=([^&]+)", uri)
-    return (match.group(1) if match else None), refreshed
+    return (match.group(1) if match else None), refreshed, expires_at
 
 RSO_AUTH_HOST = "https://authenticate.riotgames.com"
 QR_SESSION_INFO_PATH = "/api/v1/session/info"

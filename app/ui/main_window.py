@@ -19,11 +19,12 @@ from PyQt6.QtWidgets import (
     QApplication,
 )
 from PyQt6.QtCore import Qt, QTimer, QSize, pyqtSignal
-from PyQt6.QtGui import QIcon
+from PyQt6.QtGui import QIcon, QAction
 
 from app.core import load_accounts, save_accounts, PERIOD
 from app.core.fcm_service import FcmService
-from app.core import updater
+from app.core import updater, autostart
+from app.core.storage import APPDATA_DIR
 from app.core.paths import resource_path
 from app.version import __version__
 from app.api import (
@@ -34,6 +35,7 @@ from app.api import (
     verify_mfa,
     register_mfa_push_device,
     mint_access_token,
+    SessionExpired,
     parse_qr_login,
     qr_session_info,
     qr_approve,
@@ -52,6 +54,7 @@ QR_ICON_PATH = resource_path(os.path.join("images", "qr.png"))
 
 class MainWindow(QMainWindow):
     _update_found = pyqtSignal(dict)
+    _session_report = pyqtSignal(list, list, list)
 
     def __init__(self):
         super().__init__()
@@ -120,6 +123,7 @@ class MainWindow(QMainWindow):
         self._active_prompts = []
         self._tray_hint_shown = False
         self._setup_tray()
+        self._init_autostart()
 
         self.fcm = FcmService(self)
         self.fcm.push_received.connect(self._on_push)
@@ -128,6 +132,8 @@ class MainWindow(QMainWindow):
         # Keep saved Riot sessions alive: minting rotates the SSO cookies (sliding
         # expiry), so refreshing every few hours while the app sits in the tray
         # stops QR sign-in / push from expiring after a couple idle days.
+        self._fragile_warned = False
+        self._session_report.connect(self._on_session_report)
         self._session_timer = QTimer(self)
         self._session_timer.timeout.connect(self._refresh_sessions)
         self._session_timer.start(6 * 60 * 60 * 1000)  # every 6 hours
@@ -137,20 +143,67 @@ class MainWindow(QMainWindow):
         threading.Thread(target=self._check_update, daemon=True).start()
 
     def _refresh_sessions(self):
-        """Refresh every account's stored RSO session off the GUI thread so the
-        rotated SSO cookies get persisted before the old ones expire."""
+        """Refresh every account's stored RSO session off the GUI thread.
+
+        Each successful mint rotates the SSO cookies and pushes Riot's expiry ~30 days
+        out, so running this regularly is what keeps sessions alive indefinitely.
+        """
         accounts = [a for a in self.accounts if a.get("sso")]
         if not accounts:
             return
 
         def work():
+            dead, expiring, fragile = [], [], []
             for acct in accounts:
                 try:
                     self._valid_access_token(acct)
                 except Exception:
-                    pass
+                    continue
+                name = acct.get("name", "Unknown")
+                if acct.get("session_dead"):
+                    dead.append(name)
+                    continue
+                exp = acct.get("sso_expires")
+                if not exp:
+                    # Session-scoped ssid: added without "Stay signed in", so Riot
+                    # never extends it. Refreshing cannot save this one.
+                    fragile.append(name)
+                elif exp - time.time() < 5 * 86400:
+                    expiring.append(name)
+            self._session_report.emit(dead, expiring, fragile)
 
         threading.Thread(target=work, name="session-refresh", daemon=True).start()
+
+    def _on_session_report(self, dead, expiring, fragile):
+        """Surface session problems proactively instead of at QR-scan time."""
+        if dead:
+            self.tray.showMessage(
+                "Riot 2FA — re-add needed",
+                "Riot ended the session for: "
+                + ", ".join(dead)
+                + ".\nUse 'Add via Login' once to restore it.",
+                QSystemTrayIcon.MessageIcon.Warning,
+                8000,
+            )
+        elif expiring:
+            self.tray.showMessage(
+                "Riot 2FA — session expiring",
+                "Expiring soon: " + ", ".join(expiring) + ".",
+                QSystemTrayIcon.MessageIcon.Information,
+                6000,
+            )
+        if fragile and not self._fragile_warned:
+            # Once per run — it can only be cleared by re-adding, so repeating it
+            # every 6 hours would just be noise.
+            self._fragile_warned = True
+            self.tray.showMessage(
+                "Riot 2FA — sessions will expire",
+                "These were added without 'Stay signed in' and will expire in a few "
+                "days no matter what: " + ", ".join(fragile) + ".\nRe-add them once "
+                "to make them permanent.",
+                QSystemTrayIcon.MessageIcon.Warning,
+                10000,
+            )
 
     def _check_update(self):
         info = updater.check_for_update()
@@ -184,11 +237,57 @@ class MainWindow(QMainWindow):
         self.tray.setToolTip("Riot 2FA")
         menu = QMenu()
         menu.addAction("Show", self._show_from_tray)
+        if autostart.available():
+            self._autostart_action = QAction("Start with Windows", self, checkable=True)
+            self._autostart_action.toggled.connect(self._toggle_autostart)
+            menu.addAction(self._autostart_action)
         menu.addSeparator()
         menu.addAction("Quit", self._quit_app)
         self.tray.setContextMenu(menu)
         self.tray.activated.connect(self._tray_activated)
         self.tray.show()
+
+    def _init_autostart(self):
+        """Enable launch-at-login on first run (the user asked for it), refresh
+        the stored path on later runs, and reflect the state in the tray toggle."""
+        if not autostart.available():
+            return
+        # Track explicit opt-OUT rather than "first run done": if the registry value
+        # goes missing for any reason, this re-creates it instead of silently staying
+        # off forever. Regular launches are what keep the Riot sessions alive.
+        opted_out = os.path.join(APPDATA_DIR, "autostart.optout")
+        try:
+            if not os.path.exists(opted_out):
+                autostart.enable()  # also refreshes the path if the exe moved
+        except Exception:
+            pass
+        self._autostart_action.blockSignals(True)
+        self._autostart_action.setChecked(autostart.is_enabled())
+        self._autostart_action.blockSignals(False)
+
+    def _toggle_autostart(self, checked):
+        """User toggled the tray checkbox — record the choice so it sticks."""
+        opted_out = os.path.join(APPDATA_DIR, "autostart.optout")
+        try:
+            os.makedirs(APPDATA_DIR, exist_ok=True)
+            if checked:
+                autostart.enable()
+                if os.path.exists(opted_out):
+                    os.remove(opted_out)
+            else:
+                autostart.disable()
+                open(opted_out, "w").close()
+        except Exception:
+            pass
+
+    def start_in_tray(self):
+        """Launch hidden in the tray (used for --startup at login)."""
+        self.tray.showMessage(
+            "Riot 2FA",
+            "Started in the tray — click the tray icon to open.",
+            QSystemTrayIcon.MessageIcon.Information,
+            3000,
+        )
 
     def _tray_activated(self, reason):
         if reason == QSystemTrayIcon.ActivationReason.Trigger:
@@ -345,6 +444,7 @@ class MainWindow(QMainWindow):
             account["puuid"] = puuid
         if dlg.sso_cookies.get("ssid"):
             account["sso"] = dlg.sso_cookies
+            account["sso_expires"] = dlg.sso_expires
 
         access_token = self._valid_access_token(account)
         verify_tok = bearer or access_token
@@ -363,6 +463,19 @@ class MainWindow(QMainWindow):
         self.accounts.append(account)
         self._save_and_refresh()
         QMessageBox.information(self, "Success", f"2FA added for {name}{push_note}")
+
+        if account.get("sso") and not account.get("sso_expires"):
+            # Riot gave us a session-scoped ssid, i.e. "Stay signed in" didn't take.
+            # That session has a fixed short life no refresh can extend, so say so
+            # now rather than letting it quietly die in a few days.
+            QMessageBox.warning(
+                self,
+                "Session won't persist",
+                f"{name} was added, but Riot issued a non-persistent session — the "
+                "'Stay signed in' option didn't take effect.\n\nIt will stop working "
+                "within a few days. Remove the account and add it again, making sure "
+                "'Stay signed in' is ticked on the Riot login page.",
+            )
 
     def _register_push(self, access_token, id_tok, puuid):
         """Register this account's FCM device so logins push here. Best-effort."""
@@ -394,17 +507,23 @@ class MainWindow(QMainWindow):
         sso = account.get("sso")
         if sso:
             try:
-                token, refreshed = mint_access_token(sso)
+                token, refreshed, expires_at = mint_access_token(sso)
+            except SessionExpired:
+                # Genuinely dead — mark it so the UI can say "re-add" with confidence.
+                if not account.get("session_dead"):
+                    account["session_dead"] = True
+                    save_accounts(self.accounts)
+                return None
             except Exception:
-                token, refreshed = None, sso
-            dirty = False
-            if refreshed and refreshed != sso:
-                account["sso"] = refreshed  # persist Riot's rotated session cookies
-                dirty = True
-            if token:
-                account["access_token"] = token
-                dirty = True
-            if dirty:
+                # Transient (network / Riot 5xx). Leave the stored cookies ALONE and
+                # fall through to the cached token; never mark the account dead.
+                token, refreshed, expires_at = None, None, None
+            if refreshed is not None:  # only ever persist cookies from a successful mint
+                account["sso"] = refreshed
+                account["sso_expires"] = expires_at
+                account.pop("session_dead", None)
+                if token:
+                    account["access_token"] = token
                 save_accounts(self.accounts)
             if token:
                 return token
@@ -462,12 +581,22 @@ class MainWindow(QMainWindow):
             token = self._valid_access_token(account)
             if not token:
                 QApplication.restoreOverrideCursor()
-                QMessageBox.warning(
-                    self,
-                    "Session expired",
-                    f"Couldn't refresh the session for {account.get('name')}. "
-                    "Re-add it via 'Add via Login'.",
-                )
+                if account.get("session_dead"):
+                    QMessageBox.warning(
+                        self,
+                        "Session expired",
+                        f"Riot ended the saved session for {account.get('name')}.\n\n"
+                        "Re-add it once via 'Add via Login' — it will then stay signed "
+                        "in as long as you open this app at least once a month.",
+                    )
+                else:
+                    QMessageBox.warning(
+                        self,
+                        "Couldn't reach Riot",
+                        f"Temporary problem refreshing {account.get('name')}.\n\n"
+                        "Your saved session is still intact — check your connection "
+                        "and try again. No need to re-add the account.",
+                    )
                 return
             try:
                 info = qr_session_info(token, suuid, cluster)

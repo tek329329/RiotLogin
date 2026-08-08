@@ -48,14 +48,75 @@ _BEARER_JS = r"""
 """
 
 
-def _install_bearer_capture(profile):
-    script = QWebEngineScript()
-    script.setName("rso_bearer")
-    script.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentCreation)
-    script.setWorldId(QWebEngineScript.ScriptWorldId.MainWorld)
-    script.setRunsOnSubFrames(True)
-    script.setSourceCode(_BEARER_JS)
-    profile.scripts().insert(script)
+# Injected into every page: force Riot's "Stay signed in" on. It defaults to OFF,
+# and a login without it yields a *session-scoped* `ssid` — one with no expiry that
+# Riot never extends, so the saved session dies within days however often we refresh
+# it. With it on Riot issues a 30-day `ssid` that every mint pushes back out again.
+_REMEMBER_JS = r"""
+(function(){
+  if (window.__rso_remember) return; window.__rso_remember = true;
+
+  // 1. Authoritative: the login POST carries `remember`. Force it on the initial
+  //    auth prompt only — the re-auth prompt deliberately sends false.
+  var force = function(body){
+    try {
+      if (typeof body !== 'string' || body.indexOf('"type"') < 0) return body;
+      var o = JSON.parse(body);
+      if (!o || o.type !== 'auth') return body;
+      o.remember = true;
+      return JSON.stringify(o);
+    } catch(e) { return body; }
+  };
+
+  var of = window.fetch;
+  if (of) window.fetch = function(input, init){
+    try {
+      if (init && init.body) init = Object.assign({}, init, {body: force(init.body)});
+    } catch(e){}
+    return of.call(this, input, init);
+  };
+  var os = XMLHttpRequest.prototype.send;
+  XMLHttpRequest.prototype.send = function(body){
+    try { body = force(body); } catch(e){}
+    return os.call(this, body);
+  };
+
+  // 2. Tick the visible checkbox too. The social sign-in buttons (Google, Xbox, ...)
+  //    read `remember` straight off React state into a redirect URL rather than a
+  //    request body, so the box itself has to be on for those to persist.
+  var tries = 0;
+  setInterval(function(){
+    var el = document.getElementById('rememberme');
+    if (!el || el.checked || tries >= 10) return;
+    if (el.closest('[data-testid="mfa-rememberme-checkbox"]')) return;  // a different box
+    tries++;
+    el.click();  // click(), not .checked = true, so React's onChange actually runs
+  }, 300);
+})();
+"""
+
+
+def _install_page_scripts(profile):
+    for name, source in (("rso_bearer", _BEARER_JS), ("rso_remember", _REMEMBER_JS)):
+        script = QWebEngineScript()
+        script.setName(name)
+        script.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentCreation)
+        script.setWorldId(QWebEngineScript.ScriptWorldId.MainWorld)
+        script.setRunsOnSubFrames(True)
+        script.setSourceCode(source)
+        profile.scripts().insert(script)
+
+
+def _cookie_expiry(cookie):
+    """Unix expiry of a persistent cookie; None for a session cookie.
+
+    A session-scoped `ssid` is the signature of a login without "Stay signed in" —
+    it is the one thing that makes a saved account expire.
+    """
+    if cookie.isSessionCookie():
+        return None
+    stamp = cookie.expirationDate()
+    return stamp.toSecsSinceEpoch() if stamp.isValid() else None
 
 
 class LoginBrowserDialog(QDialog):
@@ -77,6 +138,7 @@ class LoginBrowserDialog(QDialog):
         self.resize(960, 720)
         self.cookies = {}
         self.sso_cookies = {}
+        self.sso_expires = None
         self.csrf_token = None
         self.id_token = None
         self.puuid = None
@@ -100,7 +162,7 @@ class LoginBrowserDialog(QDialog):
         # Off-the-record profile: a fresh session each time (so you can add a
         # different account), cookies captured live via cookieAdded.
         self.profile = QWebEngineProfile(self)
-        _install_bearer_capture(self.profile)
+        _install_page_scripts(self.profile)
         self.profile.cookieStore().cookieAdded.connect(self._cookie_added)
 
         self._page = QWebEnginePage(self.profile, self)
@@ -132,15 +194,23 @@ class LoginBrowserDialog(QDialog):
     def _cookie_added(self, cookie):
         name = bytes(cookie.name()).decode("utf-8", errors="replace")
         value = bytes(cookie.value()).decode("utf-8", errors="replace")
-        self._all.append((cookie.domain(), name, value))
+        self._all.append((cookie.domain(), name, value, _cookie_expiry(cookie)))
 
     def _cookies_for_host(self, host):
         relevant = [t for t in self._all if _domain_matches(t[0], host)]
         relevant.sort(key=lambda t: len(t[0].lstrip(".")))
         jar = {}
-        for _domain, name, value in relevant:
+        for _domain, name, value, _expiry in relevant:
             jar[name] = value
         return jar
+
+    def _expiry_for_host(self, host, name):
+        """Expiry of the cookie `name` that wins for `host` (None = session cookie)."""
+        relevant = [
+            t for t in self._all if t[1] == name and _domain_matches(t[0], host)
+        ]
+        relevant.sort(key=lambda t: len(t[0].lstrip(".")))
+        return relevant[-1][3] if relevant else None
 
     def _try_detect(self):
         if self._detected or self._busy or self._page is None:
@@ -192,6 +262,7 @@ class LoginBrowserDialog(QDialog):
         self.csrf_token = res["csrf"]
         auth = self._cookies_for_host("auth.riotgames.com")
         self.sso_cookies = {k: auth[k] for k in SSO_COOKIE_NAMES if auth.get(k)}
+        self.sso_expires = self._expiry_for_host("auth.riotgames.com", "ssid")
         self.user_info = user
         self.riot_id = riot_id_from_user(user)
         self.puuid = puuid_from_user(user)

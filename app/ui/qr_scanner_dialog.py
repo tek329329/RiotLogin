@@ -20,7 +20,7 @@ from PyQt6.QtWidgets import (
     QSizeGrip,
 )
 from PyQt6.QtCore import Qt, QTimer, QPoint, pyqtSignal
-from PyQt6.QtGui import QGuiApplication, QImage
+from PyQt6.QtGui import QGuiApplication, QImage, QCursor
 
 def _qimage_to_bgr(qimg):
     img = qimg.convertToFormat(QImage.Format.Format_RGB888)
@@ -47,7 +47,9 @@ class QrScannerDialog(QDialog):
             | Qt.WindowType.Tool
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        self.resize(300, 300)
+        # Default big enough to cover a Riot client QR without resizing (the
+        # viewport is this minus the 30px drag bar).
+        self.resize(480, 510)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -97,6 +99,13 @@ class QrScannerDialog(QDialog):
         grip_l.addLayout(gb)
 
         self._drag_offset = None
+
+        # Open centered on the screen the cursor is on, so it starts over the
+        # user's content rather than at a default corner.
+        scr = QGuiApplication.screenAt(QCursor.pos()) or QGuiApplication.primaryScreen()
+        if scr is not None:
+            c = scr.availableGeometry().center()
+            self.move(c.x() - 240, c.y() - 255)
 
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._scan_tick)
