@@ -4,6 +4,7 @@ import json
 APPDATA_DIR = os.path.join(os.getenv("APPDATA"), "Riot2FA")
 ACCOUNTS_FILE = os.path.join(APPDATA_DIR, "accounts.json")
 FCM_CREDENTIALS_FILE = os.path.join(APPDATA_DIR, "fcm_credentials.json")
+PUSH_IDS_FILE = os.path.join(APPDATA_DIR, "push_ids.json")
 
 def load_accounts():
     if not os.path.exists(ACCOUNTS_FILE):
@@ -30,3 +31,19 @@ def save_fcm_credentials(creds):
     os.makedirs(APPDATA_DIR, exist_ok=True)
     with open(FCM_CREDENTIALS_FILE, "w", encoding="utf-8") as f:
         json.dump(creds, f, indent=2)
+
+def load_push_ids():
+    """Ids of pushes already delivered, so FCM doesn't replay them next launch."""
+    if not os.path.exists(PUSH_IDS_FILE):
+        return []
+    try:
+        with open(PUSH_IDS_FILE, "r", encoding="utf-8") as f:
+            ids = json.load(f)
+        return ids if isinstance(ids, list) else []
+    except (OSError, json.JSONDecodeError):
+        return []
+
+def save_push_ids(ids):
+    os.makedirs(APPDATA_DIR, exist_ok=True)
+    with open(PUSH_IDS_FILE, "w", encoding="utf-8") as f:
+        json.dump(ids, f)
